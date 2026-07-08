@@ -93,7 +93,11 @@ def possible_unicode_or_none(u):
     if u is None:
         return None
     if isinstance(u, xmlrpc.client.Binary):
-        s = u.data.decode('utf-8')
+        try:
+            s = u.data.decode('utf-8')
+        except UnicodeDecodeError:
+            # fall back to cp1252 for old (pre-UTF-8) entries — 0x85 = ellipsis, etc.
+            s = u.data.decode('cp1252')
     else:
         try:
             s = str(u)
