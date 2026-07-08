@@ -35,6 +35,19 @@ from ljdumpsqlite import *
 from ljdumptohtml import ljdumptohtml
 
 
+# Some old (2000-2001) LJ comment/entry bodies contain bytes that are illegal in
+# XML 1.0 (stray C0 control chars) or cp1252 bytes mislabeled as utf-8. Passing
+# LJ's raw XML straight to the parser makes expat throw "not well-formed", and in
+# the comment loop a single bad body aborts the whole fetch. Read + scrub first.
+_xml_illegal_re = re.compile(r'[\x00-\x08\x0b\x0c\x0e-\x1f]')
+
+def parse_lj_xml(response):
+    raw = response.read()
+    text = raw.decode('utf-8', errors='replace')
+    text = _xml_illegal_re.sub('', text)
+    return xml.dom.minidom.parseString(text)
+
+
 MimeExtensions = {
     "image/gif": ".gif",
     "image/jpeg": ".jpg",
@@ -220,7 +233,7 @@ def ljdump(journal_server, username, password, journal_short_name, ljuniq=None, 
                         headers = {'Cookie': "ljsession="+ljsession}
                     )
                 )
-            meta = xml.dom.minidom.parse(r)
+            meta = parse_lj_xml(r)
         except Exception as x:
             print("*** Error fetching comment meta, possibly not community maintainer?")
             print("***", x)
@@ -280,7 +293,7 @@ def ljdump(journal_server, username, password, journal_short_name, ljuniq=None, 
                         headers = {'Cookie': "ljsession="+ljsession}
                     )
                 )
-                meta = xml.dom.minidom.parse(r)
+                meta = parse_lj_xml(r)
             except Exception as x:
                 print("*** Error fetching comment body, possibly not community maintainer?")
                 print("***", x)
