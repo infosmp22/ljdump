@@ -1,5 +1,9 @@
 ChangeLog - ljdump
 
+Version 1.8.1 - 2025-09-25
+
+- Parsing fix for journal entries and comments with old encoding methods, contributed by Github user Zerobatsu with Claude assist.
+
 Version 1.8 - 2025-09-25
 
 - Added some more unicode guardrails for things like icon keywords and the journal name.
