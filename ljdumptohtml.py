@@ -37,6 +37,11 @@ from xml.etree import ElementTree as ET
 from ljdumpsqlite import *
 
 
+def utc_datetime_from_timestamp(unix_timestamp):
+    """Naive UTC datetime, replacing the deprecated utcfromtimestamp() constructor."""
+    return datetime.fromtimestamp(unix_timestamp, tz=timezone.utc).replace(tzinfo=None)
+
+
 MimeExtensions = {
     "image/gif": ".gif",
     "image/jpeg": ".jpg",
@@ -45,8 +50,10 @@ MimeExtensions = {
 
 
 def write_html(filename, html_as_string):
-    f = codecs.open(filename, "w", "UTF-8")
-    f.write(html_as_string)
+    # codecs.open() is deprecated, and the handle was never closed here, which meant
+    # relying on the garbage collector to release it once per rendered page.
+    with open(filename, "w", encoding="UTF-8") as f:
+        f.write(html_as_string)
 
 
 # journal_short_name: Name of journal
@@ -138,7 +145,7 @@ def render_comment_and_subcomments_containers(comment, comments_by_id, comment_c
     span_date.text = "Date: "
     span_date_value = ET.SubElement(comment_date, 'span')
     if comment['date_unix']:
-        d = datetime.utcfromtimestamp(comment['date_unix'])
+        d = utc_datetime_from_timestamp(comment['date_unix'])
         # If anybody has a way to get rid of the leading zero that works in MacOS and Windows 11, let me know.
         dh = int(f'{d:%I}')
         span_date_value.text = html.escape(f'{d:%b}. {d.day}, {d:%Y} {dh}:{d:%M} {d:%p}')
@@ -279,7 +286,7 @@ def render_one_entry_container(journal_short_name, entry, comments_count, icons_
 
     # Datestamp
     entry_date = ET.SubElement(entry_header_inner, 'span', attrib={'class': 'datetime'})
-    d = datetime.utcfromtimestamp(entry['eventtime_unix'])
+    d = utc_datetime_from_timestamp(entry['eventtime_unix'])
     # If anybody has a way to get rid of the leading zero that works in MacOS and Windows 11, let me know.
     dh = int(f'{d:%I}')
     entry_date.text = html.escape(f'{d:%b}. {d.day}, {d:%Y} {dh}:{d:%M} {d:%p}')
@@ -395,7 +402,7 @@ def resolve_cached_image_references(content, image_urls_to_filenames):
     # Find any image URLs
     urls_found = re.findall(r'img[^<>]*\ssrc\s?=\s?[\'\"](https?:/+[^\s\"\'()<>]+)[\'\"]', content, flags=re.IGNORECASE)
     # Build a regular expression to detect images hosted on Dreamwidth
-    dw_hosted_pattern = re.compile('^https://(\w+).dreamwidth.org/file/\d+x\d+/(.+)')
+    dw_hosted_pattern = re.compile(r'^https://(\w+)\.dreamwidth\.org/file/\d+x\d+/(.+)')
     uncached_urls = []
 
     for image_url in urls_found:
@@ -735,7 +742,12 @@ def download_entry_image(img_url, journal_short_name, subfolder, image_id, entry
         return (1, None)
 
 
-def ljdumptohtml(username, journal_short_name, ljuniq=None, verbose=True, cache_images=True, retry_images=True):
+def ljdumptohtml(username, journal_short_name, ljuniq=None, verbose=True, cache_images=True, retry_images=True, should_stop=None):
+
+    # See ljdump() - an optional callable letting a caller such as the GUI interrupt us.
+    def stop_requested():
+        return should_stop is not None and should_stop()
+
     if verbose:
         print("Starting conversion for: %s" % journal_short_name)
 
@@ -745,8 +757,8 @@ def ljdumptohtml(username, journal_short_name, ljuniq=None, verbose=True, cache_
     # create a database connection
     conn = connect_to_local_journal_db("%s/journal.db" % journal_short_name, verbose)
     if not conn:
-        print("Database could not be opened for journal %s" % journal_short_name)
-        os._exit(os.EX_IOERR)
+        raise RuntimeError("Could not open the journal database: %s/journal.db"
+                           " -- run a sync first to create it." % journal_short_name)
     cur = conn.cursor()
 
     all_entries = get_all_events(cur, verbose)
@@ -784,17 +796,20 @@ def ljdumptohtml(username, journal_short_name, ljuniq=None, verbose=True, cache_
     #
 
     if cache_images:
-        dw_hosted_pattern = re.compile('^https://(\w+).dreamwidth.org/file/\d+x\d+/(.+)')
+        dw_hosted_pattern = re.compile(r'^https://(\w+)\.dreamwidth\.org/file/\d+x\d+/(.+)')
         image_resolve_max = 200
         entry_index = 0
         while image_resolve_max > 0:
+            if stop_requested():
+                print("Stop requested; ending image caching early.")
+                break
             if entry_index >= len(entries_by_date):
                 image_resolve_max = 0
             else:
                 entry = entries_by_date[entry_index]
                 entry_index += 1
                 e_id = entry['itemid']
-                entry_date = datetime.utcfromtimestamp(entry['eventtime_unix'])
+                entry_date = utc_datetime_from_timestamp(entry['eventtime_unix'])
                 entry_body = entry['event']
                 urls_found = re.findall(r'<img[^<>]*\ssrc\s?=\s?[\'\"](https?:/+[^\s\"\'()<>]+)[\'\"]', entry_body, flags=re.IGNORECASE)
                 subfolder = entry_date.strftime("%Y-%m")
@@ -811,7 +826,7 @@ def ljdumptohtml(username, journal_short_name, ljuniq=None, verbose=True, cache_
                     if cached_image['date_last_attempted']:
                         # Respect the global image cache setting
                         try_cache = retry_images
-                        current_date = int(calendar.timegm(datetime.utcnow().utctimetuple()))
+                        current_date = int(calendar.timegm(datetime.now(timezone.utc).utctimetuple()))
                         if int(current_date) - int(cached_image['date_last_attempted']) < 86400:
                             try_cache = False
                     # If we already have an image cached for this URL, skip it.
@@ -854,7 +869,7 @@ def ljdumptohtml(username, journal_short_name, ljuniq=None, verbose=True, cache_
 
     for i in range(0, len(entries_by_date)):
         entry = entries_by_date[i]
-        entry_date = datetime.utcfromtimestamp(entry['eventtime_unix'])
+        entry_date = utc_datetime_from_timestamp(entry['eventtime_unix'])
         entry_year_and_month_str = entry_date.strftime("%Y-%m")
 
         # Used for building a table of contents later
@@ -949,8 +964,8 @@ def ljdumptohtml(username, journal_short_name, ljuniq=None, verbose=True, cache_
 
         # Used for building a table of contents later
         toc = {
-            'from': datetime.utcfromtimestamp(current_group[0]['eventtime_unix']),
-            'to': datetime.utcfromtimestamp(current_group[-1]['eventtime_unix']),
+            'from': utc_datetime_from_timestamp(current_group[0]['eventtime_unix']),
+            'to': utc_datetime_from_timestamp(current_group[-1]['eventtime_unix']),
             'filename': "history/page-%s.html" % (i+1)
         }
         history_page_table_of_contents.append(toc)
@@ -966,7 +981,7 @@ def ljdumptohtml(username, journal_short_name, ljuniq=None, verbose=True, cache_
         if taglist is not None:
             # Used for building a table of contents later
             toc = {
-                'date': datetime.utcfromtimestamp(entry['eventtime_unix']),
+                'date': utc_datetime_from_timestamp(entry['eventtime_unix']),
                 'subject': entry['subject'],
                 'filename': ("entries/entry-%s.html" % entry['itemid'])
             }
@@ -1009,14 +1024,14 @@ def ljdumptohtml(username, journal_short_name, ljuniq=None, verbose=True, cache_
 
     print("Copying support files...")
 
-    # Copy the default stylesheet into the journal folder
-    source = "stylesheet.css"
-    dest = "%s/stylesheet.css" % (journal_short_name)
-    shutil.copyfile(source, dest)
-    # Copy a generic user icon into the journal folder
-    source = "user.png"
-    dest = "%s/user.png" % (journal_short_name)
-    shutil.copyfile(source, dest)
+    # These live next to this script, not in whatever directory we were launched from.
+    support_files_dir = os.path.dirname(os.path.abspath(__file__))
+    for support_file in ("stylesheet.css", "user.png"):
+        source = os.path.join(support_files_dir, support_file)
+        if not os.path.exists(source):
+            print("*** Support file missing, skipping: %s" % source)
+            continue
+        shutil.copyfile(source, "%s/%s" % (journal_short_name, support_file))
 
     finish_with_database(conn, cur)
 
@@ -1051,13 +1066,13 @@ if __name__ == "__main__":
         print("ljdumptohtml - livejournal (or Dreamwidth, etc) archive to html utility")
         print
         default_server = "https://livejournal.com"
-        server = raw_input("Alternative server to use (e.g. 'https://www.dreamwidth.org'), or hit return for '%s': " % default_server) or default_server
+        server = input("Alternative server to use (e.g. 'https://www.dreamwidth.org'), or hit return for '%s': " % default_server) or default_server
         print
         print("Enter your Livejournal (or Dreamwidth, etc) username.")
         print
-        username = raw_input("Username: ")
+        username = input("Username: ")
         print
-        journal = raw_input("Journal to render (or hit return to render '%s'): " % username)
+        journal = input("Journal to render (or hit return to render '%s'): " % username)
         print
         if journal:
             journals = [journal]

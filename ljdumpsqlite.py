@@ -869,7 +869,7 @@ def report_image_as_attempted(cur, verbose, image_id):
     :param verbose: whether we are verbose logging
     :param image_id: id of image
     """
-    current_date = calendar.timegm(datetime.utcnow().utctimetuple())
+    current_date = calendar.timegm(datetime.now(timezone.utc).utctimetuple())
     data = {
         "id": image_id,
         "date_last_attempted": current_date
@@ -887,7 +887,7 @@ def report_image_as_cached(cur, verbose, image_id, filename, date_first_seen=Non
     """
     if date_first_seen:
         date_or_none = calendar.timegm(date_first_seen.utctimetuple())
-    current_date = calendar.timegm(datetime.utcnow().utctimetuple())
+    current_date = calendar.timegm(datetime.now(timezone.utc).utctimetuple())
     data = {
         "id": image_id,
         "filename": filename,
@@ -935,6 +935,13 @@ def set_sync_status(cur, status):
     :param status: sync status record
     """
     cur.execute("UPDATE status SET lastsync = ?, lastmaxcommentid = ?", (status['last_sync'], status['last_max_comment_id']))
+
+
+def commit_database(conn):
+    """ commit any pending writes without closing the connection
+    :param conn: database connection
+    """
+    conn.commit()
 
 
 def finish_with_database(conn, cur):

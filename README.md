@@ -38,11 +38,24 @@ So, it's not possible to get the local HTML to look exactly like your online jou
 
 __To get the full archive of a very large journal, you may need to run the script multiple times, until it says there are no new changes.__  Take note of the `--max` command line argument (described below) which can be used to speed this up.
 
+### The graphical version ###
+
+If you'd rather not deal with a terminal window at all, double-click `ljdump-gui.bat` on Windows (or run `python ljdump-gui.py` on any platform).  You get a window with fields for your server, username, password and journal, and a log pane that fills in as the backup runs.
+
+The graphical version is worth using if a run has gone wrong before.  A plain terminal window closes the instant a script stops, taking the error message with it, which makes a failure impossible to diagnose.  Here, everything the backup prints — including any error and its full details — stays on screen, and is also written to a timestamped `ljdump-log-....txt` file in your backup folder so you can read it later or send it to someone.
+
+Some things worth knowing:
+
+* Your password is only saved if you tick "Remember password", because saving it means writing it to `ljdump.config` as plain text.  Everything else is remembered either way.
+* The settings are kept in the same `ljdump.config` file the command line uses, so you can switch between the two freely.
+* "Stop" finishes the item it's working on and then saves, so a long backup can be interrupted and picked up again later.
+* "Rebuild HTML pages only" regenerates the pages from what you've already downloaded, without touching the network.
+
 ### Windows ###
 
 If you don't have Python 3 installed, [download it from here](https://www.python.org/downloads/).  All the default settings are fine when you run the installer.
 
-Next, download ljdump [from the releases page](https://github.com/GBirkel/ljdump/releases/).  (Go for the zipfile in the "Assets" section.)  Open up the zip file on your machine and drag everything out into a new folder.  Then, the simplest way to go is to double-click `ljdump.py`, which will open a terminal window.
+Next, download ljdump [from the releases page](https://github.com/GBirkel/ljdump/releases/).  (Go for the zipfile in the "Assets" section.)  Open up the zip file on your machine and drag everything out into a new folder.  Then, the simplest way to go is to double-click `ljdump-gui.bat` for the graphical version, or `ljdump.py` for the terminal version.
 
 If you want to use the image caching feature, you'll need to launch the terminal window first.  Try right-clicking in the folder where you dragged the ljdump files, and choosing "Open in Terminal".  A terminal window should open that's already pointed to that directory.  Enter the following:
 

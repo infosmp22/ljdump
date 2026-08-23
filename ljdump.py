@@ -72,16 +72,29 @@ def getljsession(journal_server, username, password):
         value = r.readline()
         response[name.decode('utf-8').strip()] = value.decode('utf-8').strip()
     r.close()
+    if 'ljsession' not in response:
+        # The flat interface reports rejected logins as errmsg/errdesc with a normal
+        # 200 response, so report that text instead of a bare KeyError.
+        reason = response.get('errmsg') or response.get('errdesc') or "no session cookie was returned"
+        raise RuntimeError("Login failed for user '%s' on %s: %s" % (username, journal_server, reason))
     return response['ljsession']
 
 
 def gettext(e):
     if len(e) == 0:
         return ""
+    # An element that is present but empty (e.g. <subject></subject>) has no firstChild.
+    if e[0].firstChild is None:
+        return ""
     return e[0].firstChild.nodeValue
 
 
-def ljdump(journal_server, username, password, journal_short_name, ljuniq=None, verbose=True, max_to_fetch=100, make_pages=False, cache_images=False, retry_images=True):
+def ljdump(journal_server, username, password, journal_short_name, ljuniq=None, verbose=True, max_to_fetch=100, make_pages=False, cache_images=False, retry_images=True, should_stop=None):
+
+    # should_stop is an optional callable supplied by a caller such as the GUI. When it
+    # returns true we wrap up at the next safe point rather than running to completion.
+    def stop_requested():
+        return should_stop is not None and should_stop()
 
     m = re.search("(.*)/interface/xmlrpc", journal_server)
     if m:
@@ -93,11 +106,11 @@ def ljdump(journal_server, username, password, journal_short_name, ljuniq=None, 
 
     if verbose:
         print("Fetching journal entries for: %s" % journal_short_name)
-    try:
-        os.mkdir(journal_short_name)
+    if not os.path.isdir(journal_short_name):
+        # Don't swallow this: a permissions or bad-path failure used to vanish here and
+        # only resurface later as a confusing database error.
+        os.makedirs(journal_short_name, exist_ok=True)
         print("Created subdirectory: %s" % journal_short_name)
-    except:
-        pass
 
     ljsession = getljsession(journal_server, username, password)
 
@@ -117,7 +130,7 @@ def ljdump(journal_server, username, password, journal_short_name, ljuniq=None, 
     # create a database connection
     conn = connect_to_local_journal_db("%s/journal.db" % journal_short_name, verbose)
     if not conn:
-        os._exit(os.EX_IOERR)
+        raise RuntimeError("Could not open the journal database: %s/journal.db" % journal_short_name)
     create_tables_if_missing(conn, verbose)
     cur = conn.cursor()
 
@@ -162,7 +175,13 @@ def ljdump(journal_server, username, password, journal_short_name, ljuniq=None, 
     if verbose:
         print("Sync items to process: %s out of %s returned." % (min(max_to_fetch, len(r['syncitems'])), len(r['syncitems'])))
 
+    stopped_early = False
+
     for item in r['syncitems']:
+        if stop_requested():
+            print("Stop requested; ending entry fetch early.")
+            stopped_early = True
+            break
         if item['item'][0] == 'L':
             if verbose:
                 print("Fetching journal entry %s (%s)" % (item['item'], item['action']))
@@ -191,7 +210,16 @@ def ljdump(journal_server, username, password, journal_short_name, ljuniq=None, 
 
                     insert_or_update_event(cur, verbose, ev)
 
-                    if new_entry_count > max_to_fetch:
+                    # Commit periodically so a failure later in the run doesn't throw
+                    # away everything fetched so far.
+                    if new_entry_count % 25 == 0:
+                        commit_database(conn)
+
+                    if new_entry_count >= max_to_fetch:
+                        # Mark this item as synced before leaving the loop; the bottom of
+                        # the loop is skipped by the break, so otherwise it would be
+                        # fetched all over again on the next run.
+                        sync_status['last_sync'] = item['time']
                         break
 
                 else:
@@ -205,6 +233,14 @@ def ljdump(journal_server, username, password, journal_short_name, ljuniq=None, 
         # Assuming these emerge from the server in order by date from least to most recent...
         sync_status['last_sync'] = item['time']
         
+    set_sync_status(cur, sync_status)
+    commit_database(conn)
+
+    if stopped_early:
+        finish_with_database(conn, cur)
+        print("Stopped before fetching comments. Everything fetched so far has been saved.")
+        return
+
     #
     # Comments
     #
@@ -225,24 +261,31 @@ def ljdump(journal_server, username, password, journal_short_name, ljuniq=None, 
 
     new_max_comment_id = max_comment_id
     url = "/export_comments.bml?get=comment_meta&startid=%d&numitems=%d%s" % (new_max_comment_id+1, max_to_fetch, authas)
+    r = None
+    meta = None
     try:
-        try:
-            r = urllib.request.urlopen(
-                    urllib.request.Request(
-                        journal_server + url,
-                        headers = {'Cookie': "ljsession="+ljsession}
-                    )
+        r = urllib.request.urlopen(
+                urllib.request.Request(
+                    journal_server + url,
+                    headers = {'Cookie': "ljsession="+ljsession}
                 )
-            meta = parse_lj_xml(r)
-        except Exception as x:
-            print("*** Error fetching comment meta, possibly not community maintainer?")
-            print("***", x)
+            )
+        meta = parse_lj_xml(r)
+    except Exception as x:
+        print("*** Error fetching comment meta, possibly not community maintainer?")
+        print("***", x)
     finally:
         try:
-            r.close()
+            if r is not None:
+                r.close()
         except AttributeError: # r is sometimes a dict for unknown reasons
             pass
 
+    # This block used to live inside the finally: above, which meant a failed fetch left
+    # "meta" unbound and crashed with a NameError instead of skipping the comments.
+    if meta is None:
+        print("No comment metadata was retrieved; skipping comments for this run.")
+    else:
         for c in meta.getElementsByTagName("comment"):
             id = int(c.getAttribute("id"))
             meta_comments_fetched_count += 1
@@ -253,7 +296,7 @@ def ljdump(journal_server, username, password, journal_short_name, ljuniq=None, 
             if id > new_max_comment_id:
                 new_max_comment_id = id
 
-        maxid = int(meta.getElementsByTagName("maxid")[0].firstChild.nodeValue)
+        maxid = int(gettext(meta.getElementsByTagName("maxid")) or new_max_comment_id)
         if verbose:
             print("Fetched %d metadata entries. Our max_comment_id is now %s. Highest comment_id on server is %d." % (meta_comments_fetched_count, new_max_comment_id, maxid))
 
@@ -283,29 +326,41 @@ def ljdump(journal_server, username, password, journal_short_name, ljuniq=None, 
     for commentid in sorted_new_comment_ids:
         if commentid in comments_already_fetched:
             continue
+        if stop_requested():
+            print("Stop requested; ending comment fetch early.")
+            stopped_early = True
+            break
+        r = None
+        meta = None
         try:
             if verbose:
                 print('Fetching comment bodies starting at ID %s' % (commentid))
-            try:
-                r = urllib.request.urlopen(
-                    urllib.request.Request(
-                        journal_server+"/export_comments.bml?get=comment_body&startid=%d&numitems=%d%s" % (commentid, meta_comments_fetched_count, authas),
-                        headers = {'Cookie': "ljsession="+ljsession}
-                    )
+            r = urllib.request.urlopen(
+                urllib.request.Request(
+                    journal_server+"/export_comments.bml?get=comment_body&startid=%d&numitems=%d%s" % (commentid, meta_comments_fetched_count, authas),
+                    headers = {'Cookie': "ljsession="+ljsession}
                 )
-                meta = parse_lj_xml(r)
-            except Exception as x:
-                print("*** Error fetching comment body, possibly not community maintainer?")
-                print("***", x)
-                break
+            )
+            meta = parse_lj_xml(r)
+        except Exception as x:
+            print("*** Error fetching comment body, possibly not community maintainer?")
+            print("***", x)
+            break
         finally:
-            r.close()
+            # r stays None when the request itself failed; closing it unconditionally
+            # used to raise NameError and take the whole run down with it.
+            if r is not None:
+                r.close()
         for c in meta.getElementsByTagName("comment"):
             id = int(c.getAttribute("id"))
             if id in comments_already_fetched:
                 continue
             # We fetch in chunks, so may have actually fetched bodies past the metadata we've collected.
             if id > new_max_comment_id:
+                continue
+            if id not in metacache:
+                # Without the metadata we have no state for this comment, so skip it
+                # rather than dying with a KeyError further down.
                 continue
             jitemid = c.getAttribute("jitemid")
 
@@ -334,6 +389,15 @@ def ljdump(journal_server, username, password, journal_short_name, ljuniq=None, 
 
             if id > new_max_comment_id:
                 new_max_comment_id = id
+
+        commit_database(conn)
+
+    if stopped_early:
+        sync_status['last_max_comment_id'] = new_max_comment_id
+        set_sync_status(cur, sync_status)
+        finish_with_database(conn, cur)
+        print("Stopped after fetching comments. Everything fetched so far has been saved.")
+        return
 
     #
     # Mood information
@@ -412,6 +476,9 @@ def ljdump(journal_server, username, password, journal_short_name, ljuniq=None, 
             print("Fetching userpics for: %s" % journal_short_name)
 
         for p in userpics:
+            if stop_requested():
+                print("Stop requested; ending userpic fetch early.")
+                break
             if p is not None:
                 pic = urllib.request.urlopen(userpics[p])
                 ext = MimeExtensions.get(pic.info()["Content-Type"], "")
@@ -452,7 +519,8 @@ def ljdump(journal_server, username, password, journal_short_name, ljuniq=None, 
             journal_short_name=journal_short_name,
             verbose=verbose,
             cache_images=cache_images,
-            retry_images=retry_images
+            retry_images=retry_images,
+            should_stop=should_stop
         )
 
 if __name__ == "__main__":
